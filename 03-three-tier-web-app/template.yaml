@@ -1,0 +1,889 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Solution 03 - Highly available three-tier web application. Amazon CloudFront with a VPC origin
+  reaches an internal Application Load Balancer in private subnets (no public entry point other
+  than CloudFront). An EC2 Auto Scaling group (Graviton, IMDSv2, SSM-only access, no SSH) runs the
+  app tier and talks to an encrypted Multi-AZ Amazon RDS for PostgreSQL instance whose master
+  password is generated and rotated by RDS in AWS Secrets Manager.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Network }
+        Parameters: [VpcCidr, HighlyAvailableNat]
+      - Label: { default: Application tier }
+        Parameters: [InstanceType, LatestAmiId, MinSize, MaxSize, DesiredCapacity]
+      - Label: { default: Database tier }
+        Parameters: [DbInstanceClass, DbAllocatedStorage, DbDeletionProtection]
+      - Label: { default: Edge and operations }
+        Parameters: [WebAclArn, AlarmEmail]
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/16$"
+    Description: /16 CIDR for the VPC (split into six /24 subnets across two AZs).
+  HighlyAvailableNat:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: One NAT gateway per AZ (true) or a single shared NAT gateway to save cost (false).
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.micro, t4g.small, t4g.medium, m7g.medium, m7g.large, c7g.large]
+    Description: Graviton (arm64) instance type for the app tier.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Amazon Linux 2023 arm64 AMI resolved from the public SSM parameter.
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  MaxSize:
+    Type: Number
+    Default: 6
+    MinValue: 1
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.small
+    AllowedValues: [db.t4g.micro, db.t4g.small, db.t4g.medium, db.m7g.large, db.r7g.large]
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: Initial gp3 storage in GiB (storage autoscaling up to 5x is enabled).
+  DbDeletionProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  WebAclArn:
+    Type: String
+    Default: ""
+    Description: Optional AWS WAF web ACL ARN with CLOUDFRONT scope (created in us-east-1).
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional e-mail address for alarm notifications.
+
+Conditions:
+  UseHaNat: !Equals [!Ref HighlyAvailableNat, "true"]
+  HasWebAcl: !Not [!Equals [!Ref WebAclArn, ""]]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  # ===========================================================================
+  # Network
+  # ===========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-vpc" }]
+
+  # Required by CloudFront VPC origins (used only to mark the VPC as internet-reachable) and by NAT.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-igw" }]
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-a" }]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: false
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-b" }]
+
+  AppSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-app-a" }]
+
+  AppSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-app-b" }]
+
+  DbSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-db-a" }]
+
+  DbSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-db-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public" }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+
+  NatEip1:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-nat-a" }]
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-nat-a" }]
+
+  NatEip2:
+    Type: AWS::EC2::EIP
+    Condition: UseHaNat
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-nat-b" }]
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Condition: UseHaNat
+    Properties:
+      AllocationId: !GetAtt NatEip2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-nat-b" }]
+
+  AppRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-app-a" }]
+
+  AppRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-app-b" }]
+
+  AppDefaultRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  AppDefaultRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [UseHaNat, !Ref NatGateway2, !Ref NatGateway1]
+
+  AppSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnet1, RouteTableId: !Ref AppRouteTable1 }
+
+  AppSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnet2, RouteTableId: !Ref AppRouteTable2 }
+
+  # Database subnets have no route to the internet at all.
+  DbRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-db-isolated" }]
+
+  DbSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DbSubnet1, RouteTableId: !Ref DbRouteTable }
+
+  DbSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DbSubnet2, RouteTableId: !Ref DbRouteTable }
+
+  # Free gateway endpoint: S3 traffic (incl. Amazon Linux package repos) bypasses NAT.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref AppRouteTable1, !Ref AppRouteTable2]
+
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypts log data at rest by default; a CMK is optional and would need a log-service key policy."
+    Properties:
+      LogGroupName: !Sub "/vpc/${AWS::StackName}/flow-logs"
+      RetentionInDays: 30
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: vpc-flow-logs.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: flow-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub "${FlowLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: [logs:DescribeLogGroups]
+                Resource: "*"
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref Vpc
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 60
+
+  # ===========================================================================
+  # CloudFront origin-facing prefix list lookup (prefix list IDs differ per Region)
+  # ===========================================================================
+  PrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: describe-prefix-lists
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeManagedPrefixLists # does not support resource-level permissions
+                Resource: "*"
+
+  PrefixListLookupFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Deliberately not VPC-attached: the function only calls AWS APIs over TLS with IAM auth; a VPC would add NAT/endpoint cost and cold-start latency with no security gain."
+          - id: CKV_AWS_115
+            comment: "No reserved concurrency: new accounts may have a 10-concurrency quota, and reserving it can fail deployment. Throttling is enforced upstream (API Gateway/EventBridge)."
+          - id: CKV_AWS_116
+            comment: "Function is invoked synchronously (API Gateway, Step Functions or CloudFormation); a Lambda DLQ only applies to asynchronous invocations."
+          - id: CKV_AWS_173
+            comment: "Environment variables hold only resource names/ARNs (no secrets) and are encrypted at rest with the AWS managed key."
+    Properties:
+      Description: Resolves the CloudFront origin-facing managed prefix list ID for this Region
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt PrefixListLookupRole.Arn
+      Code:
+        ZipFile: |
+          import logging
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              data, status = {}, cfnresponse.SUCCESS
+              try:
+                  if event["RequestType"] != "Delete":
+                      name = event["ResourceProperties"]["PrefixListName"]
+                      res = boto3.client("ec2").describe_managed_prefix_lists(
+                          Filters=[{"Name": "prefix-list-name", "Values": [name]}])
+                      data["PrefixListId"] = res["PrefixLists"][0]["PrefixListId"]
+              except Exception:
+                  logging.exception("Prefix list lookup failed")
+                  status = cfnresponse.FAILED
+              cfnresponse.send(event, context, status, data, "cloudfront-origin-facing-prefix-list")
+
+  CloudFrontPrefixList:
+    Type: Custom::PrefixListLookup
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      ServiceTimeout: 120
+      PrefixListName: com.amazonaws.global.cloudfront.origin-facing
+
+  # ===========================================================================
+  # Security groups (chained, least privilege)
+  # ===========================================================================
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB - HTTP only from CloudFront origin-facing servers
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !GetAtt CloudFrontPrefixList.PrefixListId
+          Description: CloudFront VPC origin
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref VpcCidr
+          Description: To app instances
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-alb" }]
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App instances - HTTP only from the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: From ALB
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to AWS APIs, SSM and package repositories
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref VpcCidr
+          Description: PostgreSQL to the database tier
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-app" }]
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL - only from app instances, no egress
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: From app tier
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+          Description: Effectively deny all outbound
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-db" }]
+
+  # ===========================================================================
+  # Database tier
+  # ===========================================================================
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Isolated subnets for RDS
+      SubnetIds: [!Ref DbSubnet1, !Ref DbSubnet2]
+
+  RdsMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: monitoring.rds.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      DBInstanceClass: !Ref DbInstanceClass
+      DBName: appdb
+      MasterUsername: dbadmin
+      ManageMasterUserPassword: true # RDS generates, stores and rotates the password in Secrets Manager
+      AllocatedStorage: !Ref DbAllocatedStorage
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: true
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:30-sun:05:30"
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: !Ref DbDeletionProtection
+      EnableIAMDatabaseAuthentication: true
+      EnableCloudwatchLogsExports: [postgresql, upgrade]
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RdsMonitoringRole.Arn
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-db" }]
+
+  # ===========================================================================
+  # Application tier
+  # ===========================================================================
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: App instances - SSM Session Manager access and read of the DB secret only
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        Monitoring: { Enabled: true }
+        MetadataOptions:
+          HttpTokens: required # IMDSv2 only
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-app" }]
+          - ResourceType: volume
+            Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-app" }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            exec > >(tee -a /var/log/user-data.log) 2>&1
+            dnf install -y aws-cfn-bootstrap
+            signal() { /opt/aws/bin/cfn-signal -e "$1" --stack ${AWS::StackName} --resource AppAutoScalingGroup --region ${AWS::Region} || true; }
+            trap 'signal 1' ERR
+            set -eE -o pipefail
+
+            # ---- Web tier: nginx serves /health and a landing page, proxies /api/ to the app ----
+            dnf install -y nginx python3-pip
+            TOKEN=$(curl -sS -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            IID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            cat > /etc/nginx/default.d/app.conf <<'NGINX'
+            location = /health { access_log off; default_type text/plain; return 200 "ok\n"; }
+            location /api/ { proxy_pass http://127.0.0.1:8080; proxy_set_header Host $host; proxy_read_timeout 15s; }
+            NGINX
+            cat > /usr/share/nginx/html/index.html <<HTML
+            <!doctype html><html><head><meta charset="utf-8"><title>Three-tier app</title></head>
+            <body style="font-family:system-ui;max-width:40rem;margin:4rem auto">
+            <h1>Three-tier web app</h1><p>Served by <b>$IID</b> in <b>$AZ</b> via CloudFront &rarr; internal ALB &rarr; EC2.</p>
+            <p>Database check: <a href="/api/db">/api/db</a></p></body></html>
+            HTML
+            systemctl enable --now nginx
+            curl -sf http://127.0.0.1/health
+            trap - ERR
+            signal 0
+
+            # ---- App tier (best effort; failure here does not fail instance health) ----
+            set +e
+            mkdir -p /opt/app
+            curl -sSf -o /opt/app/rds-ca.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+            pip3 install --quiet pg8000 boto3
+            cat > /opt/app/app.py <<'PY'
+            import json, os, ssl
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+            import boto3, pg8000.native
+
+            SM = boto3.client("secretsmanager", region_name=os.environ["AWS_REGION"])
+            CTX = ssl.create_default_context(cafile="/opt/app/rds-ca.pem")
+
+            def check_db():
+                secret = json.loads(SM.get_secret_value(SecretId=os.environ["DB_SECRET_ARN"])["SecretString"])
+                con = pg8000.native.Connection(user=secret["username"], password=secret["password"],
+                                               host=os.environ["DB_HOST"], database="appdb",
+                                               ssl_context=CTX, timeout=5)
+                try:
+                    con.run("CREATE TABLE IF NOT EXISTS visits (id bigserial PRIMARY KEY, instance text, at timestamptz DEFAULT now())")
+                    con.run("INSERT INTO visits (instance) VALUES (:i)", i=os.environ["INSTANCE_ID"])
+                    total = con.run("SELECT count(*) FROM visits")[0][0]
+                    version = con.run("SHOW server_version")[0][0]
+                finally:
+                    con.close()
+                return {"instance": os.environ["INSTANCE_ID"], "visits": total, "postgres": version, "tls": True}
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    try:
+                        code, body = 200, check_db()
+                    except Exception as exc:
+                        code, body = 503, {"error": type(exc).__name__}
+                    data = json.dumps(body).encode()
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                def log_message(self, *args):
+                    pass
+
+            ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
+            PY
+            cat > /etc/systemd/system/app.service <<UNIT
+            [Unit]
+            Description=Demo app tier
+            After=network-online.target
+            [Service]
+            Environment=AWS_REGION=${AWS::Region}
+            Environment=DB_HOST=${Database.Endpoint.Address}
+            Environment=DB_SECRET_ARN=${Database.MasterUserSecret.SecretArn}
+            Environment=INSTANCE_ID=$IID
+            ExecStart=/usr/bin/python3 /opt/app/app.py
+            Restart=always
+            DynamicUser=yes
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable --now app
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_91
+            comment: "ALB access logs need a Region-specific bucket policy; request logs are available via CloudFront and VPC Flow Logs. Enable for production."
+    Properties:
+      Type: application
+      Scheme: internal
+      Subnets: [!Ref AppSubnet1, !Ref AppSubnet2]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+        - { Key: idle_timeout.timeout_seconds, Value: "60" }
+        - { Key: deletion_protection.enabled, Value: "false" }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_2
+            comment: "Internal ALB reachable only from CloudFront via a VPC origin over the AWS network; viewer TLS terminates at CloudFront."
+          - id: CKV_AWS_103
+            comment: "No TLS listener by design - see CKV_AWS_2."
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [AppDefaultRoute1, AppDefaultRoute2, AppSubnet1RouteAssoc, AppSubnet2RouteAssoc]
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref MinSize
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+    Properties:
+      VPCZoneIdentifier: [!Ref AppSubnet1, !Ref AppSubnet2]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs: [!Ref AppTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - { Key: Project, Value: !Ref AWS::StackName, PropagateAtLaunch: true }
+
+  CpuTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+
+  # ===========================================================================
+  # Edge: CloudFront with a VPC origin (ALB is never exposed to the internet)
+  # ===========================================================================
+  AlbVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    DependsOn: HttpListener
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub "${AWS::StackName}-alb"
+        Arn: !Ref ApplicationLoadBalancer
+        HTTPPort: 80
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_174
+            comment: "Default *.cloudfront.net certificate; attach an ACM certificate with TLSv1.2_2021 for a custom domain."
+          - id: CKV_AWS_86
+            comment: "Standard logging omitted to keep the stack self-contained; enable CloudFront logging for production."
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} three-tier app"
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        WebACLId: !If [HasWebAcl, !Ref WebAclArn, !Ref AWS::NoValue]
+        Origins:
+          - Id: AlbVpcOrigin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt AlbVpcOrigin.Id
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+        DefaultCacheBehavior:
+          TargetOriginId: AlbVpcOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3 # Managed-AllViewer
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+
+  # ===========================================================================
+  # Observability
+  # ===========================================================================
+  AlarmKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "${AWS::StackName} - SNS alarm topic encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: ["kms:Decrypt", "kms:GenerateDataKey*"]
+            Resource: "*"
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref AlarmKey
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: One or more app instances are failing ALB health checks
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt AppTargetGroup.TargetGroupFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Target5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: App targets returning 5XX responses
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  DbCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database CPU above 80 percent
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlarmTopic]
+
+  DbStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database free storage below 2 GiB
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  ApplicationUrl:
+    Description: Public entry point (CloudFront)
+    Value: !Sub "https://${Distribution.DomainName}"
+  DatabaseCheckUrl:
+    Value: !Sub "https://${Distribution.DomainName}/api/db"
+  InternalAlbDnsName:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DatabaseSecretArn:
+    Description: Secrets Manager secret managed and rotated by RDS
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+  AutoScalingGroupName:
+    Value: !Ref AppAutoScalingGroup
+  VpcId:
+    Value: !Ref Vpc

@@ -1,0 +1,25 @@
+%% Solution 05 - Serverless relational API with Aurora Serverless v2 + Data API (official AWS Architecture Icons)
+flowchart LR
+  client@{ icon: "aws:res-client", form: "square", label: "IAM-authenticated client<br/>service / CI / CLI", pos: "b", h: 56 }
+  subgraph cloud["AWS Cloud - Region"]
+    direction LR
+    iam@{ icon: "aws:awsidentityandaccessmanagement", form: "square", label: "IAM<br/>execute-api:Invoke policy", pos: "b", h: 52 }
+    apigw@{ icon: "aws:amazonapigateway", form: "square", label: "API Gateway HTTP API<br/>AWS_IAM auth, throttling", pos: "b", h: 56 }
+    lambda@{ icon: "aws:awslambda", form: "square", label: "Lambda (no VPC)<br/>parameterised SQL", pos: "b", h: 56 }
+    dataapi@{ icon: "aws:amazonrds", form: "square", label: "RDS Data API<br/>HTTPS + IAM", pos: "b", h: 52 }
+    sm@{ icon: "aws:awssecretsmanager", form: "square", label: "Secrets Manager<br/>DB credentials (KMS)", pos: "b", h: 52 }
+    subgraph vpc["VPC - isolated subnets, no IGW / NAT"]
+      aurora@{ icon: "aws:amazonaurora", form: "square", label: "Aurora PostgreSQL<br/>Serverless v2, encrypted", pos: "b", h: 56 }
+    end
+    kms@{ icon: "aws:awskeymanagementservice", form: "square", label: "KMS customer managed key", pos: "b", h: 48 }
+    cw@{ icon: "aws:amazoncloudwatch", form: "square", label: "CloudWatch logs + alarms", pos: "b", h: 48 }
+  end
+  client -- "SigV4-signed HTTPS" --> apigw
+  iam -. "authorises" .-> apigw
+  apigw -- "proxy" --> lambda
+  lambda -- "ExecuteStatement" --> dataapi
+  dataapi -. "GetSecretValue<br/>(caller's IAM)" .-> sm
+  dataapi -- "private" --> aurora
+  kms -. "encrypts" .-> aurora
+  kms -. "encrypts" .-> sm
+  lambda -.-> cw

@@ -1,0 +1,500 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Solution 05 - Serverless relational API. Amazon API Gateway HTTP API with IAM (SigV4)
+  authorization invokes AWS Lambda, which queries Amazon Aurora PostgreSQL Serverless v2 through
+  the RDS Data API - no VPC-attached Lambda, no connection pool, no database drivers. The cluster
+  lives in isolated subnets, is encrypted with a customer managed AWS KMS key, and its
+  credentials are held in AWS Secrets Manager.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: catalog
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+  MinCapacity:
+    Type: Number
+    Default: 0.5
+    AllowedValues: [0, 0.5, 1, 2]
+    Description: Minimum Aurora capacity units. 0 enables auto-pause (requires an engine version that supports it).
+  MaxCapacity:
+    Type: Number
+    Default: 4
+    AllowedValues: [1, 2, 4, 8, 16]
+  CreateReaderInstance:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Add a second Serverless v2 instance in another AZ for Multi-AZ failover.
+  DbDeletionProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/24
+    Description: Small CIDR for the database-only VPC (two isolated /26 subnets are created).
+
+Conditions:
+  HasReader: !Equals [!Ref CreateReaderInstance, "true"]
+  AutoPause: !Equals [!Ref MinCapacity, "0"]
+
+Resources:
+  # ===========================================================================
+  # Encryption and credentials
+  # ===========================================================================
+  DbKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "${ProjectName} - Aurora storage and database secret encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+
+  DbKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-db"
+      TargetKeyId: !Ref DbKey
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/aurora/admin"
+      Description: Aurora admin credentials used by the RDS Data API
+      KmsKeyId: !Ref DbKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "catalog_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: "\"@/\\'` "
+
+  # ===========================================================================
+  # Network (database only - no internet route, no NAT)
+  # ===========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-db-vpc" }]
+
+  DbSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 6]]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-db-a" }]
+
+  DbSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 6]]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-db-b" }]
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora cluster - no inbound rules (accessed only via the RDS Data API)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+          Description: Effectively deny all outbound
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Isolated subnets for Aurora
+      SubnetIds: [!Ref DbSubnet1, !Ref DbSubnet2]
+
+  # ===========================================================================
+  # Aurora PostgreSQL Serverless v2 with the RDS Data API
+  # ===========================================================================
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      DatabaseName: catalog
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      EnableHttpEndpoint: true # RDS Data API
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+        SecondsUntilAutoPause: !If [AutoPause, 900, !Ref AWS::NoValue]
+      StorageEncrypted: true
+      KmsKeyId: !Ref DbKey
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref DbSecurityGroup]
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00"
+      CopyTagsToSnapshot: true
+      DeletionProtection: !Ref DbDeletionProtection
+      EnableCloudwatchLogsExports: [postgresql]
+      EnableIAMDatabaseAuthentication: true
+      Tags: [{ Key: Project, Value: !Ref ProjectName }]
+
+  RdsMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: monitoring.rds.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+
+  DbWriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref DbCluster
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+      PromotionTier: 0
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RdsMonitoringRole.Arn
+
+  DbReaderInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: HasReader
+    DependsOn: DbWriterInstance
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref DbCluster
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+      PromotionTier: 1
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RdsMonitoringRole.Arn
+
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref DbCluster
+      TargetType: AWS::RDS::DBCluster
+
+  # ===========================================================================
+  # Lambda (not VPC-attached)
+  # ===========================================================================
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypts log data at rest by default; a CMK is optional and would need a log-service key policy."
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-api"
+      RetentionInDays: 30
+
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: data-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ApiFunctionLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"
+              - Sid: DataApiOnThisClusterOnly
+                Effect: Allow
+                Action: [rds-data:ExecuteStatement, rds-data:BatchExecuteStatement,
+                         rds-data:BeginTransaction, rds-data:CommitTransaction, rds-data:RollbackTransaction]
+                Resource: !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DbCluster}"
+              - Sid: ReadDbSecret # Data API retrieves the secret using the caller's credentials
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DbSecret
+              - Sid: DecryptDbSecret
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt DbKey.Arn
+                Condition:
+                  StringEquals: { "kms:ViaService": !Sub "secretsmanager.${AWS::Region}.amazonaws.com" }
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Deliberately not VPC-attached: the function only calls AWS APIs over TLS with IAM auth; a VPC would add NAT/endpoint cost and cold-start latency with no security gain."
+          - id: CKV_AWS_115
+            comment: "No reserved concurrency: new accounts may have a 10-concurrency quota, and reserving it can fail deployment. Throttling is enforced upstream (API Gateway/EventBridge)."
+          - id: CKV_AWS_116
+            comment: "Function is invoked synchronously (API Gateway, Step Functions or CloudFormation); a Lambda DLQ only applies to asynchronous invocations."
+          - id: CKV_AWS_173
+            comment: "Environment variables hold only resource names/ARNs (no secrets) and are encrypted at rest with the AWS managed key."
+    DependsOn: [DbWriterInstance, DbSecretAttachment]
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api"
+      Description: Product catalog API backed by Aurora via the RDS Data API
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt ApiFunctionRole.Arn
+      TracingConfig: { Mode: Active }
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref ApiFunctionLogGroup
+      Environment:
+        Variables:
+          CLUSTER_ARN: !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DbCluster}"
+          SECRET_ARN: !Ref DbSecret
+          DB_NAME: catalog
+      Code:
+        ZipFile: |
+          import json, os, time, uuid, logging
+          import boto3
+          from botocore.exceptions import ClientError
+
+          rds = boto3.client("rds-data")
+          log = logging.getLogger()
+          BASE = {"resourceArn": os.environ["CLUSTER_ARN"], "secretArn": os.environ["SECRET_ARN"],
+                  "database": os.environ["DB_NAME"]}
+          SCHEMA = ("CREATE TABLE IF NOT EXISTS products (id uuid PRIMARY KEY, name text NOT NULL, "
+                    "price numeric(12,2) NOT NULL CHECK (price >= 0), created_at timestamptz NOT NULL DEFAULT now())")
+          _ready = False
+
+          def sql(statement, params=None):
+              for attempt in range(6):
+                  try:
+                      res = rds.execute_statement(sql=statement, parameters=params or [],
+                                                  formatRecordsAs="JSON", **BASE)
+                      return json.loads(res.get("formattedRecords") or "[]")
+                  except ClientError as err:
+                      if err.response["Error"]["Code"] != "DatabaseResumingException":
+                          raise
+                      time.sleep(min(2 ** attempt, 10))  # cluster waking from auto-pause
+              raise RuntimeError("database did not resume in time")
+
+          def p(name, value, hint=None):
+              param = {"name": name, "value": {"stringValue": str(value)}}
+              if hint:
+                  param["typeHint"] = hint
+              return param
+
+          def out(code, body=None):
+              return {"statusCode": code, "headers": {"Content-Type": "application/json"},
+                      "body": "" if body is None else json.dumps(body, default=str)}
+
+          def handler(event, context):
+              global _ready
+              if not _ready:
+                  sql(SCHEMA)
+                  _ready = True
+              route = event["routeKey"]
+              pid = (event.get("pathParameters") or {}).get("id")
+              try:
+                  if pid is not None:
+                      uuid.UUID(pid)
+                  if route == "GET /products":
+                      return out(200, sql("SELECT id, name, price, created_at FROM products ORDER BY created_at DESC LIMIT 100"))
+                  if route == "GET /products/{id}":
+                      rows = sql("SELECT id, name, price, created_at FROM products WHERE id = :id", [p("id", pid, "UUID")])
+                      return out(200, rows[0]) if rows else out(404, {"message": "Not found"})
+                  if route == "POST /products":
+                      body = json.loads(event.get("body") or "{}")
+                      name, price = str(body["name"]).strip(), float(body["price"])
+                      if not name or len(name) > 200 or price < 0:
+                          raise ValueError("invalid product")
+                      rows = sql("INSERT INTO products (id, name, price) VALUES (:id, :name, :price) RETURNING id, name, price, created_at",
+                                 [p("id", uuid.uuid4(), "UUID"), p("name", name), p("price", f"{price:.2f}", "DECIMAL")])
+                      return out(201, rows[0])
+                  if route == "DELETE /products/{id}":
+                      rows = sql("DELETE FROM products WHERE id = :id RETURNING id", [p("id", pid, "UUID")])
+                      return out(204) if rows else out(404, {"message": "Not found"})
+                  return out(404, {"message": "Unknown route"})
+              except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                  return out(400, {"message": "Invalid request"})
+
+  # ===========================================================================
+  # HTTP API with IAM authorization
+  # ===========================================================================
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-http-api"
+      ProtocolType: HTTP
+      Description: Product catalog - every route requires SigV4-signed requests
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 29000
+
+  ListProductsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /products"
+      AuthorizationType: AWS_IAM
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  GetProductRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /products/{id}"
+      AuthorizationType: AWS_IAM
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  CreateProductRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /products"
+      AuthorizationType: AWS_IAM
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  DeleteProductRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "DELETE /products/{id}"
+      AuthorizationType: AWS_IAM
+      Target: !Sub "integrations/${LambdaIntegration}"
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypts log data at rest by default; a CMK is optional and would need a log-service key policy."
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-http-api"
+      RetentionInDays: 30
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        DetailedMetricsEnabled: true
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 100
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","caller":"$context.identity.caller","userArn":"$context.identity.userArn",
+          "ip":"$context.identity.sourceIp","route":"$context.routeKey","status":"$context.status",
+          "latency":"$context.responseLatency","integrationError":"$context.integrationErrorMessage"}
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/products*"
+
+  # Attach this policy to the roles/users (or a CI pipeline role) allowed to call the API.
+  ApiClientPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Grants permission to call the catalog HTTP API (SigV4)
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: execute-api:Invoke
+            Resource: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/$default/*/products*"
+
+  # ===========================================================================
+  # Alarms
+  # ===========================================================================
+  FunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Catalog API Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Catalog HTTP API returning 5xx
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - { Name: ApiId, Value: !Ref HttpApi }
+        - { Name: Stage, Value: $default }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  DbCapacityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Aurora Serverless v2 running near its maximum capacity
+      Namespace: AWS/RDS
+      MetricName: ACUUtilization
+      Dimensions: [{ Name: DBClusterIdentifier, Value: !Ref DbCluster }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiEndpoint:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+  ApiClientPolicyArn:
+    Description: Attach to any IAM principal that should call the API
+    Value: !Ref ApiClientPolicy
+  ClusterArn:
+    Value: !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DbCluster}"
+  DbSecretArn:
+    Value: !Ref DbSecret

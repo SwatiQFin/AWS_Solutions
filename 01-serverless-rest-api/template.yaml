@@ -1,0 +1,661 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Solution 01 - Secure serverless REST API. Amazon API Gateway (REST, regional) protected by
+  AWS WAF and an Amazon Cognito authorizer, AWS Lambda (Python, arm64) business logic and an
+  Amazon DynamoDB table encrypted with a customer managed AWS KMS key. Includes X-Ray tracing,
+  structured logging, request validation, throttling and CloudWatch alarms.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: General }
+        Parameters: [ProjectName, StageName]
+      - Label: { default: Operations }
+        Parameters: [AlarmEmail, LogRetentionInDays, EnableTableDeletionProtection]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: notes-api
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+    Description: Lower-case name used to prefix resources (3-31 chars).
+  StageName:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-zA-Z0-9_]{1,32}$"
+    Description: API Gateway stage name.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional e-mail address subscribed to alarm notifications (leave blank to skip).
+  LogRetentionInDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+    Description: Retention for Lambda and API access logs.
+  EnableTableDeletionProtection:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Turn on DynamoDB deletion protection (recommended for production).
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Encryption
+  # ---------------------------------------------------------------------------
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "${ProjectName} - encrypts DynamoDB data and SNS alarm topic"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudWatchAlarmsToUseKeyForSns
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: ["kms:Decrypt", "kms:GenerateDataKey*"]
+            Resource: "*"
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-data"
+      TargetKeyId: !Ref DataKey
+
+  # ---------------------------------------------------------------------------
+  # Data layer
+  # ---------------------------------------------------------------------------
+  NotesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: noteId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: noteId, KeyType: RANGE }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt DataKey.Arn
+      DeletionProtectionEnabled: !Ref EnableTableDeletionProtection
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # ---------------------------------------------------------------------------
+  # Identity
+  # ---------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-users"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      MfaConfiguration: "OPTIONAL"
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 3
+      UserPoolTags:
+        Project: !Ref ProjectName
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${ProjectName}-client"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # ---------------------------------------------------------------------------
+  # Compute
+  # ---------------------------------------------------------------------------
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypts log data at rest by default; a CMK is optional and would need a log-service key policy."
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-handler"
+      RetentionInDays: !Ref LogRetentionInDays
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Least-privilege execution role for the notes API handler
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${FunctionLogGroup.Arn}:*"
+        - PolicyName: tracing
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"
+        - PolicyName: dynamodb
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource: !GetAtt NotesTable.Arn
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey*, kms:DescribeKey]
+                Resource: !GetAtt DataKey.Arn
+                Condition:
+                  StringLike: { "kms:ViaService": "dynamodb.*.amazonaws.com" }
+
+  NotesFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Deliberately not VPC-attached: the function only calls AWS APIs over TLS with IAM auth; a VPC would add NAT/endpoint cost and cold-start latency with no security gain."
+          - id: CKV_AWS_115
+            comment: "No reserved concurrency: new accounts may have a 10-concurrency quota, and reserving it can fail deployment. Throttling is enforced upstream (API Gateway/EventBridge)."
+          - id: CKV_AWS_116
+            comment: "Function is invoked synchronously (API Gateway, Step Functions or CloudFormation); a Lambda DLQ only applies to asynchronous invocations."
+          - id: CKV_AWS_173
+            comment: "Environment variables hold only resource names/ARNs (no secrets) and are encrypted at rest with the AWS managed key."
+    Properties:
+      FunctionName: !Sub "${ProjectName}-handler"
+      Description: CRUD handler for per-user notes
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 10
+      Role: !GetAtt FunctionRole.Arn
+      TracingConfig: { Mode: Active }
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref FunctionLogGroup
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref NotesTable
+      Code:
+        ZipFile: |
+          import json, os, uuid, logging
+          from datetime import datetime, timezone
+          import boto3
+          from boto3.dynamodb.conditions import Key
+          from botocore.exceptions import ClientError
+
+          log = logging.getLogger()
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+          HDR = {"Content-Type": "application/json", "Cache-Control": "no-store"}
+
+          def resp(code, body=None):
+              return {"statusCode": code, "headers": HDR,
+                      "body": "" if body is None else json.dumps(body, default=str)}
+
+          def public(item):
+              return {k: v for k, v in item.items() if k != "userId"}
+
+          def handler(event, context):
+              user = event["requestContext"]["authorizer"]["claims"]["sub"]
+              method = event["httpMethod"]
+              note_id = (event.get("pathParameters") or {}).get("noteId")
+              now = datetime.now(timezone.utc).isoformat()
+              try:
+                  if note_id is None:
+                      if method == "GET":
+                          res = table.query(KeyConditionExpression=Key("userId").eq(user), Limit=100)
+                          return resp(200, [public(i) for i in res["Items"]])
+                      if method == "POST":
+                          body = json.loads(event.get("body") or "{}")
+                          item = {"userId": user, "noteId": str(uuid.uuid4()), "title": body["title"],
+                                  "content": body.get("content", ""), "createdAt": now, "updatedAt": now}
+                          table.put_item(Item=item, ConditionExpression="attribute_not_exists(noteId)")
+                          return resp(201, public(item))
+                      return resp(405, {"message": "Method not allowed"})
+                  key = {"userId": user, "noteId": note_id}
+                  if method == "GET":
+                      item = table.get_item(Key=key).get("Item")
+                      return resp(200, public(item)) if item else resp(404, {"message": "Not found"})
+                  if method == "PUT":
+                      body = json.loads(event.get("body") or "{}")
+                      res = table.update_item(
+                          Key=key,
+                          UpdateExpression="SET #t = :t, #c = :c, updatedAt = :u",
+                          ConditionExpression="attribute_exists(noteId)",
+                          ExpressionAttributeNames={"#t": "title", "#c": "content"},
+                          ExpressionAttributeValues={":t": body["title"], ":c": body.get("content", ""), ":u": now},
+                          ReturnValues="ALL_NEW")
+                      return resp(200, public(res["Attributes"]))
+                  if method == "DELETE":
+                      table.delete_item(Key=key, ConditionExpression="attribute_exists(noteId)")
+                      return resp(204)
+                  return resp(405, {"message": "Method not allowed"})
+              except ClientError as err:
+                  if err.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                      return resp(404, {"message": "Not found"})
+                  log.exception("DynamoDB error")
+                  return resp(500, {"message": "Internal error"})
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # ---------------------------------------------------------------------------
+  # API Gateway (REST)
+  # ---------------------------------------------------------------------------
+  # Retained on delete: the account-level API Gateway setting keeps pointing at this role, and deleting it
+  # would silently break CloudWatch logging for every other REST API in the Region.
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Allows API Gateway to push execution logs to CloudWatch (Region-wide account setting)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      Description: Notes REST API secured by Cognito and AWS WAF
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      DisableExecuteApiEndpoint: false
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: cognito
+      RestApiId: !Ref RestApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs: [!GetAtt UserPool.Arn]
+
+  BodyValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref RestApi
+      Name: body-and-params
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  NoteModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref RestApi
+      Name: NoteInput
+      ContentType: application/json
+      Schema:
+        $schema: "http://json-schema.org/draft-04/schema#"
+        title: NoteInput
+        type: object
+        additionalProperties: false
+        required: [title]
+        properties:
+          title: { type: string, minLength: 1, maxLength: 200 }
+          content: { type: string, maxLength: 10000 }
+
+  NotesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: notes
+
+  NoteResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref NotesResource
+      PathPart: "{noteId}"
+
+  ListNotesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref NotesResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NotesFunction.Arn}/invocations"
+
+  CreateNoteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref NotesResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestValidatorId: !Ref BodyValidator
+      RequestModels:
+        application/json: !Ref NoteModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NotesFunction.Arn}/invocations"
+
+  GetNoteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref NoteResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.path.noteId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NotesFunction.Arn}/invocations"
+
+  UpdateNoteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref NoteResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestValidatorId: !Ref BodyValidator
+      RequestParameters:
+        method.request.path.noteId: true
+      RequestModels:
+        application/json: !Ref NoteModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NotesFunction.Arn}/invocations"
+
+  DeleteNoteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref NoteResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.path.noteId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NotesFunction.Arn}/invocations"
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref NotesFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/${StageName}/*/notes*"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ListNotesMethod
+      - CreateNoteMethod
+      - GetNoteMethod
+      - UpdateNoteMethod
+      - DeleteNoteMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: Initial deployment
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypts log data at rest by default; a CMK is optional and would need a log-service key policy."
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-access"
+      RetentionInDays: !Ref LogRetentionInDays
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_120
+            comment: "Responses are per-user and private; caching would add cost and risk serving one user data to another."
+    DependsOn: ApiGatewayAccount
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","user":"$context.authorizer.claims.sub",
+          "requestTime":"$context.requestTime","method":"$context.httpMethod","path":"$context.resourcePath",
+          "status":"$context.status","latency":"$context.responseLatency","integrationStatus":"$context.integration.status",
+          "wafStatus":"$context.waf.status","xrayTraceId":"$context.xrayTraceId"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: ERROR
+          DataTraceEnabled: false
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 100
+
+  # ---------------------------------------------------------------------------
+  # Edge protection (AWS WAF)
+  # ---------------------------------------------------------------------------
+  ApiWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-api-acl"
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${ProjectName}-api-acl"
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 0
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesCommonRuleSet }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: common }
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: bad-inputs }
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 2
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesAmazonIpReputationList }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: ip-reputation }
+        - Name: RateLimitPerIp
+          Priority: 3
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: 1000
+              AggregateKeyType: IP
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: rate-limit }
+
+  ApiWebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${RestApi}/stages/${ApiStage}"
+      WebACLArn: !GetAtt ApiWebAcl.Arn
+
+  # ---------------------------------------------------------------------------
+  # Observability
+  # ---------------------------------------------------------------------------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alarms"
+      KmsMasterKeyId: !Ref DataKey
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  FunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda handler is returning errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref NotesFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  FunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda handler is being throttled
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{ Name: FunctionName, Value: !Ref NotesFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API is returning 5XX errors
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - { Name: ApiName, Value: !Sub "${ProjectName}-api" }
+        - { Name: Stage, Value: !Ref ApiStage }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API p99 latency above 2 seconds
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - { Name: ApiName, Value: !Sub "${ProjectName}-api" }
+        - { Name: Stage, Value: !Ref ApiStage }
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 2000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the notes API
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  NotesTableName:
+    Value: !Ref NotesTable
+  WebAclArn:
+    Value: !GetAtt ApiWebAcl.Arn
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic

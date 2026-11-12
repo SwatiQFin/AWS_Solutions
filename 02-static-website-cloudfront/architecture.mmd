@@ -1,0 +1,28 @@
+%% Solution 02 - Secure static website on S3 + CloudFront (official AWS Architecture Icons)
+flowchart LR
+  user@{ icon: "aws:res-users", form: "square", label: "Visitors", pos: "b", h: 56 }
+  subgraph cloud["AWS Cloud"]
+    direction LR
+    r53@{ icon: "aws:amazonroute53", form: "square", label: "Route 53<br/>A / AAAA alias (optional)", pos: "b", h: 56 }
+    subgraph edge["Global edge - CloudFront"]
+      direction LR
+      waf@{ icon: "aws:awswaf", form: "square", label: "AWS WAF<br/>(optional web ACL)", pos: "b", h: 52 }
+      cf@{ icon: "aws:amazoncloudfront", form: "square", label: "CloudFront distribution<br/>HTTP/2+3, TLS, security headers", pos: "b", h: 56 }
+      fn@{ icon: "aws:res-amazoncloudfrontfunctions", form: "square", label: "CloudFront Function<br/>clean-URL rewrite", pos: "b", h: 52 }
+      acm@{ icon: "aws:awscertificatemanager", form: "square", label: "ACM certificate<br/>us-east-1 (optional)", pos: "b", h: 52 }
+    end
+    subgraph region["Region"]
+      direction LR
+      site@{ icon: "aws:amazonsimplestorageservice", form: "square", label: "S3 site bucket<br/>private, versioned, SSE", pos: "b", h: 56 }
+      logs@{ icon: "aws:res-amazonsimplestorageservicebucketwithobjects", form: "square", label: "S3 logs bucket<br/>CloudFront + S3 access logs", pos: "b", h: 52 }
+      seed@{ icon: "aws:awslambda", form: "square", label: "Lambda custom resource<br/>seed content / empty on delete", pos: "b", h: 52 }
+    end
+  end
+  user -- "DNS" --> r53
+  user -- "HTTPS" --> waf --> cf
+  fn -. "viewer-request" .-> cf
+  acm -. "TLS" .-> cf
+  cf -- "Origin Access Control<br/>SigV4-signed GET" --> site
+  cf -. "access logs" .-> logs
+  site -. "server access logs" .-> logs
+  seed -. "deploy-time" .-> site

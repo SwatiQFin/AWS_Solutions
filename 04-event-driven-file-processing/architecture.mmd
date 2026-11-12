@@ -1,0 +1,26 @@
+%% Solution 04 - Event-driven file processing (official AWS Architecture Icons)
+flowchart LR
+  prod@{ icon: "aws:res-user", form: "square", label: "Producer<br/>uploads CSV", pos: "b", h: 56 }
+  subgraph cloud["AWS Cloud - Region"]
+    direction LR
+    s3@{ icon: "aws:amazonsimplestorageservice", form: "square", label: "S3 bucket (SSE-KMS)<br/>incoming/ processed/<br/>archive/ quarantine/", pos: "b", h: 56 }
+    eb@{ icon: "aws:amazoneventbridge", form: "square", label: "EventBridge rule<br/>Object Created, prefix incoming/", pos: "b", h: 56 }
+    dlq@{ icon: "aws:amazonsimplequeueservice", form: "square", label: "SQS DLQ<br/>failed deliveries", pos: "b", h: 52 }
+    sfn@{ icon: "aws:awsstepfunctions", form: "square", label: "Step Functions workflow<br/>retries, catch, X-Ray", pos: "b", h: 56 }
+    ddb@{ icon: "aws:amazondynamodb", form: "square", label: "DynamoDB jobs table<br/>GSI byStatus", pos: "b", h: 56 }
+    lambda@{ icon: "aws:awslambda", form: "square", label: "Lambda processor<br/>validate + summarise", pos: "b", h: 56 }
+    sns@{ icon: "aws:amazonsimplenotificationservice", form: "square", label: "SNS notifications<br/>rejected / failed", pos: "b", h: 52 }
+    kms@{ icon: "aws:awskeymanagementservice", form: "square", label: "KMS customer managed key", pos: "b", h: 48 }
+    cw@{ icon: "aws:amazoncloudwatch", form: "square", label: "CloudWatch alarms", pos: "b", h: 48 }
+  end
+  prod -- "1 - PUT incoming/file.csv" --> s3
+  s3 -- "2 - event" --> eb
+  eb -- "3 - StartExecution" --> sfn
+  eb -. "after retries" .-> dlq
+  sfn -- "4 - job PROCESSING" --> ddb
+  sfn -- "5 - invoke" --> lambda
+  lambda -- "6 - read, write summary,<br/>archive or quarantine" --> s3
+  sfn -- "7 - SUCCEEDED / REJECTED / FAILED" --> ddb
+  sfn -- "8 - notify" --> sns
+  kms -. "encrypts" .-> s3
+  cw -. "ExecutionsFailed, DLQ depth" .-> sns

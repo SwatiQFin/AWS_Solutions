@@ -1,0 +1,5 @@
+node_modules/
+tools/diagrams/aws-icon-pack.json
+tools/diagrams/package-lock.json
+.DS_Store
+*.swp

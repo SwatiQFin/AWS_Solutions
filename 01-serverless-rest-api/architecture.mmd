@@ -1,0 +1,30 @@
+%% Solution 01 - Secure serverless REST API (rendered with official AWS Architecture Icons)
+flowchart LR
+  user@{ icon: "aws:res-users", form: "square", label: "API clients", pos: "b", h: 56 }
+
+  subgraph cloud["AWS Cloud - Region"]
+    direction LR
+    cognito@{ icon: "aws:amazoncognito", form: "square", label: "Amazon Cognito<br/>user pool (MFA, SRP)", pos: "b", h: 56 }
+    waf@{ icon: "aws:awswaf", form: "square", label: "AWS WAF<br/>managed rules + rate limit", pos: "b", h: 56 }
+    apigw@{ icon: "aws:amazonapigateway", form: "square", label: "API Gateway REST API<br/>JWT auth, schema validation, throttling", pos: "b", h: 56 }
+    lambda@{ icon: "aws:awslambda", form: "square", label: "AWS Lambda<br/>notes handler (arm64)", pos: "b", h: 56 }
+    ddb@{ icon: "aws:amazondynamodb", form: "square", label: "Amazon DynamoDB<br/>PK userId / SK noteId, PITR", pos: "b", h: 56 }
+    kms@{ icon: "aws:awskeymanagementservice", form: "square", label: "AWS KMS<br/>customer managed key", pos: "b", h: 56 }
+    subgraph obs["Observability"]
+      direction LR
+      cw@{ icon: "aws:amazoncloudwatch", form: "square", label: "CloudWatch<br/>logs, metrics, alarms", pos: "b", h: 48 }
+      xray@{ icon: "aws:awsxray", form: "square", label: "AWS X-Ray", pos: "b", h: 48 }
+      sns@{ icon: "aws:amazonsimplenotificationservice", form: "square", label: "Amazon SNS<br/>alarm topic", pos: "b", h: 48 }
+    end
+  end
+
+  user -- "1 - sign in" --> cognito
+  user -- "2 - HTTPS + ID token" --> waf
+  waf --> apigw
+  apigw -. "3 - verify JWT" .-> cognito
+  apigw -- "4 - Lambda proxy" --> lambda
+  lambda -- "5 - least-privilege CRUD" --> ddb
+  kms -. "SSE" .-> ddb
+  lambda -.-> xray
+  apigw -. "access logs" .-> cw
+  cw -. "alarms" .-> sns

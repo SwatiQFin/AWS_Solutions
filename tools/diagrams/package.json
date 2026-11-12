@@ -1,0 +1,13 @@
+{
+  "name": "aws-solutions-diagrams",
+  "private": true,
+  "description": "Renders the Mermaid architecture diagrams with the official AWS Architecture Icons",
+  "scripts": {
+    "render": "node build-icon-pack.js && node render-all.js"
+  },
+  "dependencies": {
+    "aws-icons": "3.3.0",
+    "mermaid": "^11.17.0",
+    "puppeteer": "^23.11.1"
+  }
+}

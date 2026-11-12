@@ -1,0 +1,34 @@
+%% Solution 03 - Highly available three-tier web app (official AWS Architecture Icons)
+flowchart LR
+  user@{ icon: "aws:res-users", form: "square", label: "Users", pos: "b", h: 56 }
+  cf@{ icon: "aws:amazoncloudfront", form: "square", label: "Amazon CloudFront<br/>+ optional AWS WAF", pos: "b", h: 56 }
+  subgraph vpc["VPC 10.0.0.0/16 - two Availability Zones"]
+    direction LR
+    subgraph pub["Public subnets"]
+      igw@{ icon: "aws:res-amazonvpcinternetgateway", form: "square", label: "Internet gateway", pos: "b", h: 48 }
+      nat@{ icon: "aws:res-amazonvpcnatgateway", form: "square", label: "NAT gateway per AZ", pos: "b", h: 48 }
+    end
+    subgraph app["Private app subnets"]
+      direction TB
+      alb@{ icon: "aws:res-elasticloadbalancingapplicationloadbalancer", form: "square", label: "Internal ALB<br/>CloudFront VPC origin", pos: "b", h: 56 }
+      asg@{ icon: "aws:amazonec2autoscaling", form: "square", label: "EC2 Auto Scaling group<br/>Graviton, IMDSv2, no SSH", pos: "b", h: 56 }
+    end
+    subgraph data["Isolated DB subnets - no internet route"]
+      rds@{ icon: "aws:amazonrds", form: "square", label: "RDS PostgreSQL<br/>Multi-AZ, encrypted", pos: "b", h: 56 }
+    end
+    s3ep@{ icon: "aws:res-amazonvpcendpoints", form: "square", label: "S3 gateway endpoint", pos: "b", h: 44 }
+    flow@{ icon: "aws:res-amazonvpcflowlogs", form: "square", label: "VPC Flow Logs", pos: "b", h: 44 }
+  end
+  sm@{ icon: "aws:awssecretsmanager", form: "square", label: "Secrets Manager<br/>RDS-managed, rotated", pos: "b", h: 52 }
+  ssm@{ icon: "aws:awssystemsmanager", form: "square", label: "SSM Session Manager", pos: "b", h: 52 }
+  cw@{ icon: "aws:amazoncloudwatch", form: "square", label: "CloudWatch alarms -> SNS", pos: "b", h: 52 }
+
+  user -- "HTTPS" --> cf
+  cf -- "private VPC origin<br/>(prefix-list-restricted SG)" --> alb
+  alb -- "HTTP :80 from ALB SG only" --> asg
+  asg -- "TLS :5432 from app SG only" --> rds
+  asg -. "GetSecretValue" .-> sm
+  asg -. "outbound 443" .-> nat --> igw
+  asg -. "packages" .-> s3ep
+  ssm -. "shell access, audited" .-> asg
+  rds -.-> cw

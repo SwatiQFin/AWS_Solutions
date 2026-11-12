@@ -1,0 +1,638 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Solution 04 - Event-driven file processing pipeline. CSV uploads to an encrypted Amazon S3
+  bucket emit Amazon EventBridge events that start an AWS Step Functions workflow. The workflow
+  tracks job state in Amazon DynamoDB (direct service integration), validates and transforms the
+  file with AWS Lambda, archives or quarantines it, and notifies via Amazon SNS. Failed event
+  deliveries land in an SQS dead-letter queue.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: file-pipeline
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Optional e-mail for rejected/failed file notifications and alarms.
+  RequiredColumns:
+    Type: String
+    Default: "id,date,amount,currency"
+    Description: Comma-separated header columns every CSV file must contain.
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Resources:
+  # ===========================================================================
+  # Encryption
+  # ===========================================================================
+  PipelineKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "${ProjectName} - S3, DynamoDB and SNS encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudWatchAlarmsToPublishToEncryptedTopic
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: ["kms:Decrypt", "kms:GenerateDataKey*"]
+            Resource: "*"
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+
+  PipelineKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}"
+      TargetKeyId: !Ref PipelineKey
+
+  # ===========================================================================
+  # Storage
+  # ===========================================================================
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Object-level activity is captured by CloudTrail data events / EventBridge; enable server access logging if required by policy."
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt PipelineKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration: { Status: Enabled }
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-to-ia
+            Status: Enabled
+            Prefix: archive/
+            Transitions:
+              - { StorageClass: STANDARD_IA, TransitionInDays: 30 }
+              - { StorageClass: GLACIER_IR, TransitionInDays: 90 }
+          - Id: expire-quarantine
+            Status: Enabled
+            Prefix: quarantine/
+            ExpirationInDays: 90
+          - Id: tidy-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt DataBucket.Arn, !Sub "${DataBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: jobId, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: jobId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: byStatus
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt PipelineKey.Arn
+
+  # ===========================================================================
+  # Messaging
+  # ===========================================================================
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-notifications"
+      KmsMasterKeyId: !Ref PipelineKey
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  EventsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_27
+            comment: "Encrypted with SSE-SQS (SqsManagedSseEnabled); a CMK would require an EventBridge key policy grant."
+    Properties:
+      QueueName: !Sub "${ProjectName}-events-dlq"
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  EventsDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventsDeadLetterQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeRuleDlq
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventsDeadLetterQueue.Arn
+            Condition:
+              ArnEquals: { "aws:SourceArn": !GetAtt FileUploadedRule.Arn }
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "sqs:*"
+            Resource: !GetAtt EventsDeadLetterQueue.Arn
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # ===========================================================================
+  # Processing Lambda
+  # ===========================================================================
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypts log data at rest by default; a CMK is optional and would need a log-service key policy."
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-processor"
+      RetentionInDays: 30
+
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: processor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ProcessorLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"
+              - Sid: ListForAccurate404s # without ListBucket, HeadObject on a missing key returns 403
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+              - Sid: ReadAndRemoveIncoming
+                Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub "${DataBucket.Arn}/incoming/*"
+              - Sid: WriteOutputs
+                Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub "${DataBucket.Arn}/processed/*"
+                  - !Sub "${DataBucket.Arn}/archive/*"
+                  - !Sub "${DataBucket.Arn}/quarantine/*"
+              - Sid: UseBucketKey
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: !GetAtt PipelineKey.Arn
+                Condition:
+                  StringEquals: { "kms:ViaService": !Sub "s3.${AWS::Region}.amazonaws.com" }
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Deliberately not VPC-attached: the function only calls AWS APIs over TLS with IAM auth; a VPC would add NAT/endpoint cost and cold-start latency with no security gain."
+          - id: CKV_AWS_115
+            comment: "No reserved concurrency: new accounts may have a 10-concurrency quota, and reserving it can fail deployment. Throttling is enforced upstream (API Gateway/EventBridge)."
+          - id: CKV_AWS_116
+            comment: "Function is invoked synchronously (API Gateway, Step Functions or CloudFormation); a Lambda DLQ only applies to asynchronous invocations."
+          - id: CKV_AWS_173
+            comment: "Environment variables hold only resource names/ARNs (no secrets) and are encrypted at rest with the AWS managed key."
+    Properties:
+      FunctionName: !Sub "${ProjectName}-processor"
+      Description: Validates a CSV, writes a JSON summary, then archives or quarantines the source
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 512
+      Timeout: 120
+      Role: !GetAtt ProcessorRole.Arn
+      TracingConfig: { Mode: Active }
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref ProcessorLogGroup
+      Environment:
+        Variables:
+          REQUIRED_COLUMNS: !Ref RequiredColumns
+          MAX_BYTES: "52428800"
+      Code:
+        ZipFile: |
+          import csv, io, json, os, logging
+          from decimal import Decimal, InvalidOperation
+          from urllib.parse import unquote_plus
+          import boto3
+          from botocore.exceptions import ClientError
+
+          s3 = boto3.client("s3")
+          log = logging.getLogger()
+          REQUIRED = [c.strip() for c in os.environ["REQUIRED_COLUMNS"].split(",") if c.strip()]
+          MAX_BYTES = int(os.environ["MAX_BYTES"])
+
+          def resolve_key(bucket, key):
+              # EventBridge may deliver URL-encoded keys; try raw first, then decoded.
+              for candidate in (key, unquote_plus(key)):
+                  try:
+                      return candidate, s3.head_object(Bucket=bucket, Key=candidate)
+                  except ClientError as err:
+                      if err.response["Error"]["Code"] not in ("404", "NoSuchKey", "NotFound"):
+                          raise
+              raise FileNotFoundError(key)
+
+          def move(bucket, key, prefix):
+              dest = prefix + key[len("incoming/"):]
+              s3.copy_object(Bucket=bucket, Key=dest, CopySource={"Bucket": bucket, "Key": key})
+              s3.delete_object(Bucket=bucket, Key=key)
+              return dest
+
+          def validate(text):
+              reader = csv.DictReader(io.StringIO(text))
+              missing = [c for c in REQUIRED if c not in (reader.fieldnames or [])]
+              if missing:
+                  return None, "missing columns: " + ",".join(missing)
+              rows, bad, totals = 0, [], {}
+              for line_no, row in enumerate(reader, start=2):
+                  rows += 1
+                  try:
+                      amount = Decimal(row["amount"])
+                      if not row["currency"] or len(row["currency"]) != 3:
+                          raise ValueError("currency")
+                      totals[row["currency"]] = totals.get(row["currency"], Decimal(0)) + amount
+                  except (InvalidOperation, ValueError, TypeError, KeyError):
+                      bad.append(line_no)
+              if rows == 0:
+                  return None, "file has no data rows"
+              if bad:
+                  return None, f"{len(bad)} invalid rows (first: line {bad[0]})"
+              return {"rowCount": rows, "totals": {k: str(v) for k, v in totals.items()}}, None
+
+          def handler(event, context):
+              bucket = event["bucket"]
+              key, head = resolve_key(bucket, event["key"])
+              if head["ContentLength"] > MAX_BYTES:
+                  return {"valid": False, "reason": "file too large", "objectKey": move(bucket, key, "quarantine/")}
+              body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+              try:
+                  summary, reason = validate(body.decode("utf-8-sig"))
+              except UnicodeDecodeError:
+                  summary, reason = None, "file is not UTF-8 text"
+              if reason:
+                  log.warning("Rejected %s: %s", key, reason)
+                  return {"valid": False, "reason": reason, "objectKey": move(bucket, key, "quarantine/")}
+              out_key = "processed/" + key[len("incoming/"):] + ".summary.json"
+              s3.put_object(Bucket=bucket, Key=out_key, ContentType="application/json",
+                            Body=json.dumps({"source": key, **summary}).encode())
+              archived = move(bucket, key, "archive/")
+              return {"valid": True, "rowCount": summary["rowCount"], "outputKey": out_key, "objectKey": archived}
+
+  # ===========================================================================
+  # Orchestration
+  # ===========================================================================
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_158
+            comment: "CloudWatch Logs encrypts log data at rest by default; a CMK is optional and would need a log-service key policy."
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/${ProjectName}"
+      RetentionInDays: 30
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: workflow
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: [!GetAtt ProcessorFunction.Arn, !Sub "${ProcessorFunction.Arn}:*"]
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt JobsTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey*, kms:DescribeKey]
+                Resource: !GetAtt PipelineKey.Arn
+                Condition:
+                  StringLike:
+                    "kms:ViaService": ["dynamodb.*.amazonaws.com", !Sub "sns.${AWS::Region}.amazonaws.com"]
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets]
+                Resource: "*"
+              - Sid: CloudWatchLogsDelivery # these actions do not support resource-level permissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  FileWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-workflow"
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StateMachineRole.Arn
+      TracingConfiguration: { Enabled: true }
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionSubstitutions:
+        TableName: !Ref JobsTable
+        FunctionArn: !GetAtt ProcessorFunction.Arn
+        TopicArn: !Ref NotificationTopic
+      Definition:
+        Comment: Validate, transform and file an uploaded CSV
+        StartAt: RecordJobStarted
+        States:
+          RecordJobStarted:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:putItem
+            Parameters:
+              TableName: "${TableName}"
+              Item:
+                jobId: { "S.$": "$$.Execution.Name" }
+                status: { "S": "PROCESSING" }
+                bucket: { "S.$": "$.detail.bucket.name" }
+                objectKey: { "S.$": "$.detail.object.key" }
+                createdAt: { "S.$": "$$.Execution.StartTime" }
+            ResultPath: null
+            Next: ProcessFile
+          ProcessFile:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: "${FunctionArn}"
+              Payload:
+                "bucket.$": "$.detail.bucket.name"
+                "key.$": "$.detail.object.key"
+            ResultSelector:
+              "result.$": "$.Payload"
+            ResultPath: "$.processing"
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 4
+                BackoffRate: 2
+                JitterStrategy: FULL
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                ResultPath: "$.error"
+                Next: RecordJobFailed
+            Next: IsFileValid
+          IsFileValid:
+            Type: Choice
+            Choices:
+              - Variable: "$.processing.result.valid"
+                BooleanEquals: true
+                Next: RecordJobSucceeded
+            Default: RecordJobRejected
+          RecordJobSucceeded:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:updateItem
+            Parameters:
+              TableName: "${TableName}"
+              Key:
+                jobId: { "S.$": "$$.Execution.Name" }
+              UpdateExpression: "SET #s = :s, #t = :t, #r = :r, #o = :o, #a = :a"
+              ExpressionAttributeNames: { "#s": "status", "#t": "completedAt", "#r": "rowCount", "#o": "outputKey", "#a": "archivedKey" }
+              ExpressionAttributeValues:
+                ":s": { "S": "SUCCEEDED" }
+                ":t": { "S.$": "$$.State.EnteredTime" }
+                ":r": { "N.$": "States.Format('{}', $.processing.result.rowCount)" }
+                ":o": { "S.$": "$.processing.result.outputKey" }
+                ":a": { "S.$": "$.processing.result.objectKey" }
+            ResultPath: null
+            End: true
+          RecordJobRejected:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:updateItem
+            Parameters:
+              TableName: "${TableName}"
+              Key:
+                jobId: { "S.$": "$$.Execution.Name" }
+              UpdateExpression: "SET #s = :s, #t = :t, #r = :r, #q = :q"
+              ExpressionAttributeNames: { "#s": "status", "#t": "completedAt", "#r": "reason", "#q": "quarantineKey" }
+              ExpressionAttributeValues:
+                ":s": { "S": "REJECTED" }
+                ":t": { "S.$": "$$.State.EnteredTime" }
+                ":r": { "S.$": "$.processing.result.reason" }
+                ":q": { "S.$": "$.processing.result.objectKey" }
+            ResultPath: null
+            Next: NotifyRejected
+          NotifyRejected:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: "${TopicArn}"
+              Subject: "File rejected"
+              "Message.$": "States.Format('File {} was rejected: {}. Moved to {}.', $.detail.object.key, $.processing.result.reason, $.processing.result.objectKey)"
+            ResultPath: null
+            End: true
+          RecordJobFailed:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:updateItem
+            Parameters:
+              TableName: "${TableName}"
+              Key:
+                jobId: { "S.$": "$$.Execution.Name" }
+              UpdateExpression: "SET #s = :s, #t = :t, #e = :e"
+              ExpressionAttributeNames: { "#s": "status", "#t": "completedAt", "#e": "errorType" }
+              ExpressionAttributeValues:
+                ":s": { "S": "FAILED" }
+                ":t": { "S.$": "$$.State.EnteredTime" }
+                ":e": { "S.$": "$.error.Error" }
+            ResultPath: null
+            Next: NotifyFailed
+          NotifyFailed:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: "${TopicArn}"
+              Subject: "File processing failed"
+              "Message.$": "States.Format('Processing of {} failed with {}. Execution: {}', $.detail.object.key, $.error.Error, $$.Execution.Id)"
+            ResultPath: null
+            Next: WorkflowFailed
+          WorkflowFailed:
+            Type: Fail
+            Error: FileProcessingFailed
+            Cause: See the RecordJobFailed state and the processor Lambda logs
+
+  # ===========================================================================
+  # Event routing
+  # ===========================================================================
+  EventsInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: start-workflow
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref FileWorkflow
+
+  FileUploadedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Start the workflow when a file lands under incoming/
+      State: ENABLED
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref DataBucket]
+          object:
+            key: [{ prefix: incoming/ }]
+      Targets:
+        - Id: file-workflow
+          Arn: !Ref FileWorkflow
+          RoleArn: !GetAtt EventsInvokeRole.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 8
+            MaximumEventAgeInSeconds: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt EventsDeadLetterQueue.Arn
+
+  # ===========================================================================
+  # Alarms
+  # ===========================================================================
+  WorkflowFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Step Functions executions failed
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{ Name: StateMachineArn, Value: !Ref FileWorkflow }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Events could not be delivered to the workflow
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt EventsDeadLetterQueue.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref NotificationTopic]
+
+Outputs:
+  DataBucketName:
+    Description: Upload CSV files to s3://<bucket>/incoming/
+    Value: !Ref DataBucket
+  StateMachineArn:
+    Value: !Ref FileWorkflow
+  JobsTableName:
+    Value: !Ref JobsTable
+  NotificationTopicArn:
+    Value: !Ref NotificationTopic
+  DeadLetterQueueUrl:
+    Value: !Ref EventsDeadLetterQueue
